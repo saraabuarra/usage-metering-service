@@ -1,16 +1,17 @@
-
 import "dotenv/config";
 import express from "express";
 import { pool } from "./db.js";
+import accountsRouter from "./accounts.js";
 import usersRouter from "./users.js";
 import usageRouter from "./usage.js";
 import quotasRouter from "./quotas.js";
-
+import plansRouter from "./plans.js";
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
 app.use(express.json());
-
+app.use("/api/plans", plansRouter);
+app.use("/api/accounts", accountsRouter);
 app.use("/api/users", usersRouter);
 app.use("/api/usage", usageRouter);
 app.use("/api/quotas", quotasRouter);
@@ -32,4 +33,3 @@ if (process.env.NODE_ENV !== "test") {
 }
 
 export default app;
-

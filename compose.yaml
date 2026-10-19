@@ -17,5 +17,18 @@ services:
       timeout: 5s
       retries: 5
 
+  api:
+    build: .
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DATABASE_URL: postgresql://app_user:local_dev_password@db:5432/usage_metering
+    ports:
+      - "3000:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+
 volumes:
   postgres_data:

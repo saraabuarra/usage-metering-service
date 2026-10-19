@@ -1,90 +1,196 @@
-
 import { afterAll, describe, expect, it } from "vitest";
 import request from "supertest";
 import app from "../src/index.js";
 import { pool } from "../src/db.js";
 
-describe("Usage and quota API", () => {
-  let userId: number | undefined;
+describe("Accounts, authentication, and metering", () => {
+  let accountAId: number | undefined;
+  let accountBId: number | undefined;
 
   afterAll(async () => {
-    if (userId !== undefined) {
-      await pool.query("DELETE FROM users WHERE id = $1", [userId]);
+    if (accountAId !== undefined) {
+      await pool.query("DELETE FROM accounts WHERE id = $1", [accountAId]);
+    }
+
+    if (accountBId !== undefined) {
+      await pool.query("DELETE FROM accounts WHERE id = $1", [accountBId]);
     }
 
     await pool.end();
   });
 
-  it("creates a user, enforces the quota, and prevents duplicate usage", async () => {
-    const email = `test-${Date.now()}@example.com`;
+  it("authenticates accounts, isolates users, and enforces request limits", async () => {
+    // Create two separate accounts.
+    const accountA = await request(app)
+      .post("/api/accounts")
+      .send({ name: `Test Account A ${Date.now()}` });
 
-    // Create a user
-    const userResponse = await request(app)
+    expect(accountA.status).toBe(201);
+    accountAId = accountA.body.account.id;
+    const apiKeyA = accountA.body.apiKey;
+
+    const accountB = await request(app)
+      .post("/api/accounts")
+      .send({ name: `Test Account B ${Date.now()}` });
+
+    expect(accountB.status).toBe(201);
+    accountBId = accountB.body.account.id;
+    const apiKeyB = accountB.body.apiKey;
+
+    // Missing and invalid API keys must be rejected.
+    expect((await request(app).get("/api/users")).status).toBe(401);
+
+    expect(
+      (
+        await request(app)
+          .get("/api/users")
+          .set("x-api-key", "invalid-api-key")
+      ).status,
+    ).toBe(401);
+
+    // Create one user in each account.
+    const userAResponse = await request(app)
       .post("/api/users")
-      .send({ name: "Test User", email });
-
-    expect(userResponse.status).toBe(201);
-    userId = userResponse.body.user.id;
-
-    // Create an active quota of 100 units
-    const now = Date.now();
-    const periodStart = new Date(now - 60_000).toISOString();
-    const periodEnd = new Date(now + 86_400_000).toISOString();
-
-    const quotaResponse = await request(app)
-      .post("/api/quotas")
+      .set("x-api-key", apiKeyA)
       .send({
-        userId,
-        quotaLimit: 100,
-        periodStart,
-        periodEnd,
+        name: "User A",
+        email: `user-a-${Date.now()}@example.com`,
       });
 
-    expect(quotaResponse.status).toBe(201);
-    expect(quotaResponse.body.quota.quota_limit).toBe("100");
+    expect(userAResponse.status).toBe(201);
+    const userAId = userAResponse.body.user.id;
 
-    // Record 30 units
-    const usageResponse = await request(app)
-      .post("/api/usage")
+    const userBResponse = await request(app)
+      .post("/api/users")
+      .set("x-api-key", apiKeyB)
       .send({
-        userId,
-        quantity: 30,
-        idempotencyKey: `test-${Date.now()}-first`,
+        name: "User B",
+        email: `user-b-${Date.now()}@example.com`,
       });
 
-    expect(usageResponse.status).toBe(201);
-    expect(usageResponse.body.totalUsage).toBe("30");
+    expect(userBResponse.status).toBe(201);
 
-    const idempotencyKey = `test-${Date.now()}-duplicate`;
+    // Each account can see only its own users.
+    const usersA = await request(app)
+      .get("/api/users")
+      .set("x-api-key", apiKeyA);
 
-    // Record 20 units using a key we'll reuse
-    const firstRequest = await request(app)
+    expect(usersA.status).toBe(200);
+    expect(usersA.body.users.map((user: { id: number }) => user.id))
+      .toContain(userAId);
+
+    expect(
+      usersA.body.users.some(
+        (user: { id: number }) => user.id === userBResponse.body.user.id,
+      ),
+    ).toBe(false);
+
+    // Account B cannot meter a user belonging to account A.
+    const crossAccount = await request(app)
       .post("/api/usage")
-      .send({ userId, quantity: 20, idempotencyKey });
-
-    expect(firstRequest.status).toBe(201);
-    expect(firstRequest.body.totalUsage).toBe("50");
-
-    // Repeating the same request must not add usage again
-    const duplicateRequest = await request(app)
-      .post("/api/usage")
-      .send({ userId, quantity: 20, idempotencyKey });
-
-    expect(duplicateRequest.status).toBe(200);
-    expect(duplicateRequest.body.duplicate).toBe(true);
-
-    // 50 used + 60 requested would exceed the quota
-    const exceededResponse = await request(app)
-      .post("/api/usage")
+      .set("x-api-key", apiKeyB)
       .send({
-        userId,
-        quantity: 60,
-        idempotencyKey: `test-${Date.now()}-exceeded`,
+        userId: userAId,
+        quantity: 1,
+        requestId: `cross-${Date.now()}`,
       });
 
-    expect(exceededResponse.status).toBe(429);
-    expect(exceededResponse.body.error).toBe("Quota exceeded");
-    expect(exceededResponse.body.currentUsage).toBe("50");
-    expect(exceededResponse.body.quotaLimit).toBe("100");
+    expect(crossAccount.status).toBe(404);
+
+    // A valid request is accepted.
+    const requestId = `accepted-${Date.now()}`;
+
+    const accepted = await request(app)
+      .post("/api/usage")
+      .set("x-api-key", apiKeyA)
+      .send({
+        userId: userAId,
+        quantity: 10,
+        requestId,
+      });
+
+    expect(accepted.status).toBe(201);
+    expect(accepted.body.accepted).toBe(true);
+    expect(accepted.body.userUsage).toBe("10");
+
+    // Repeating the same request does not consume usage twice.
+    const duplicate = await request(app)
+      .post("/api/usage")
+      .set("x-api-key", apiKeyA)
+      .send({
+        userId: userAId,
+        quantity: 10,
+        requestId,
+      });
+
+    expect(duplicate.status).toBe(200);
+    expect(duplicate.body.duplicate).toBe(true);
+
+    // Basic plan permits at most 20 units per request.
+    const userLimit = await request(app)
+      .post("/api/usage")
+      .set("x-api-key", apiKeyA)
+      .send({
+        userId: userAId,
+        quantity: 21,
+        requestId: `user-limit-${Date.now()}`,
+      });
+
+    expect(userLimit.status).toBe(429);
+    expect(userLimit.body.accepted).toBe(false);
+    expect(userLimit.body.rejectedBy).toBe("user");
+
+    // Starter plan permits at most 100 units per request.
+    const accountLimit = await request(app)
+      .post("/api/usage")
+      .set("x-api-key", apiKeyA)
+      .send({
+        userId: userAId,
+        quantity: 101,
+        requestId: `account-limit-${Date.now()}`,
+      });
+
+    expect(accountLimit.status).toBe(429);
+    expect(accountLimit.body.accepted).toBe(false);
+    expect(accountLimit.body.rejectedBy).toBe("account");
+
+    // The monthly summary reports accepted usage and remaining allowance.
+    const summary = await request(app)
+      .get("/api/usage/summary")
+      .set("x-api-key", apiKeyA);
+
+    expect(summary.status).toBe(200);
+    expect(summary.body.timezone).toBe("UTC");
+    expect(summary.body.account.usage).toBe("10");
+    expect(summary.body.account.remaining).toBe("9990");
+
+    const summarizedUser = summary.body.users.find(
+      (user: { user_id: number }) => user.user_id === userAId,
+    );
+
+    expect(summarizedUser).toBeDefined();
+    expect(summarizedUser.usage).toBe("10");
+    expect(summarizedUser.remaining).toBe("990");
+
+    // Invalid month values are rejected.
+    const invalidMonth = await request(app)
+      .get("/api/usage/summary?month=2026-13")
+      .set("x-api-key", apiKeyA);
+
+    expect(invalidMonth.status).toBe(400);
+
+    // Rejected requests are included in the history.
+    const history = await request(app)
+      .get(`/api/usage/${userAId}`)
+      .set("x-api-key", apiKeyA);
+
+    expect(history.status).toBe(200);
+    expect(
+      history.body.requests.some(
+        (item: { request_id: string; accepted: boolean }) =>
+          item.request_id.startsWith("user-limit-") &&
+          item.accepted === false,
+      ),
+    ).toBe(true);
   });
 });
